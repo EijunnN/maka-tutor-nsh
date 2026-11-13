@@ -1,0 +1,23 @@
+[package]
+name = "nsh-app-maka-tutor-nsh"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+nsh-core = "0.5.0"
+nsh-base = "0.5.0"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# Captura de pantalla (GDI) y exclusión de capturas (SetWindowDisplayAffinity).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }
+windows-core = "0.62"

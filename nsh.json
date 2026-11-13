@@ -1,0 +1,27 @@
+{
+  "name": "Maka Tutor NSH",
+  "id": "com.eijunnn.makatutornsh",
+  "version": "0.1.0",
+  "build": 1,
+  "rust": ".",
+  "window": {
+    "title": "Maka Tutor",
+    "defaultSize": { "width": 420, "height": 620 },
+    "maximizable": false,
+    "closeOnPress": false,
+    "defaultVisible": false,
+    "frame": "none",
+    "backdrop": "hud",
+    "shadow": true
+  },
+  "capabilities": {
+    "windows": { "kinds": ["normal", "popup", "overlay"], "overlay": true },
+    "process": {
+      "execute": ["claude"],
+      "env": ["APPDATA", "LOCALAPPDATA", "USERNAME", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"]
+    },
+    "fs": { "read": ["${dataDir}"], "write": ["${dataDir}"] },
+    "clipboard": true,
+    "statusBar": true
+  }
+}
