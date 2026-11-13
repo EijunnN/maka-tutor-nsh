@@ -837,8 +837,11 @@ mod tests {
     }
 
     // Un solo test (no en paralelo): el tono de uno no debe oírse en otro.
+    // Necesita una salida de audio (las máquinas de CI no tienen):
+    // `cargo test -- --ignored`.
     #[cfg(windows)]
     #[test]
+    #[ignore]
     fn captura_el_tono_del_equipo_y_del_proceso_pero_no_de_otro() {
         use super::Target;
         let system = loudest_while_playing(Target::System);
