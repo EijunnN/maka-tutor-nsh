@@ -1,0 +1,141 @@
+# Publica una versión: al subir un tag vX.Y.Z (lo hace `bun scripts/release.ts X.Y.Z`)
+# pasa los tests, empaqueta Windows y Linux, firma el manifiesto de
+# actualización (latest.json) y crea el GitHub Release del que la app se
+# actualiza sola (nsh.json "updater"). En cada push a master solo prueba.
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NSH_VERSION: v0.5.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+          - os: ubuntu-24.04
+            target: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencias de Linux (GTK 4, WebKitGTK, GStreamer, OpenSSL)
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang pkg-config libgtk-4-dev libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libssl-dev xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Instalar nsh (Linux)
+        if: matrix.target == 'linux'
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | NSH_VERSION="$NSH_VERSION" sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Instalar nsh (Windows)
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          Invoke-RestMethod -UseBasicParsing https://nsh.dev/install.ps1 | Invoke-Expression
+          "$env:LOCALAPPDATA\nsh\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: El tag coincide con nsh.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(bun -e 'console.log(JSON.parse(require("fs").readFileSync("nsh.json","utf8")).version)')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "nsh.json dice $version y el tag es $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Tests (JS)
+        if: matrix.target == 'linux'
+        run: bun test tests/
+
+      - name: Tests (Rust)
+        run: cargo test
+
+      - name: Captura X11 real (Xvfb)
+        if: matrix.target == 'linux'
+        run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test captura_la_pantalla_x11 -- --ignored
+
+      - name: Tipos
+        run: nsh check
+
+      - name: Empaquetar
+        run: nsh package App.tsx --target ${{ matrix.target }} --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/Maka-Tutor-NSH-*.zip
+            dist/Maka-Tutor-NSH-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Instalar nsh
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | NSH_VERSION="$NSH_VERSION" sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Notas (los commits desde la versión anterior)
+        run: |
+          previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          range=${previous:+$previous..}$GITHUB_REF_NAME
+          git log --no-merges --format='- %s' "$range" | grep -v '^- release: ' > notes.md || true
+          test -s notes.md || echo "- Versión ${GITHUB_REF_NAME#v}" > notes.md
+          cat notes.md
+
+      - name: Manifiesto firmado (latest.json)
+        env:
+          NSH_UPDATE_KEY: ${{ secrets.NSH_UPDATE_KEY }}
+        run: |
+          test -n "$NSH_UPDATE_KEY" || { echo "Falta el secreto NSH_UPDATE_KEY"; exit 1; }
+          umask 077
+          printf '%s' "$NSH_UPDATE_KEY" > "$RUNNER_TEMP/update.secret"
+          nsh update-manifest dist/*.zip dist/*.tar.gz --notes notes.md --key "$RUNNER_TEMP/update.secret"
+          rm -f "$RUNNER_TEMP/update.secret"
+          mv latest.json latest.json.sig dist/
+          ls -la dist
+
+      - name: Publicar el Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Maka Tutor NSH ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md

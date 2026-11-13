@@ -3,7 +3,7 @@
 // Escape cancela (la ventana se abre con `closeOnEscape`). La imagen no se
 // vuelve a capturar: `Screen.crop` recorta la que ya se tomó, así que lo que
 // se ve debajo es solo la guía.
-import { PanResponder, signal, Text, View } from "nsh";
+import { Image, PanResponder, signal, Text, View } from "nsh";
 
 type Point = { x: number; y: number };
 type Size = { width: number; height: number };
@@ -14,7 +14,14 @@ export type Selection = { x: number; y: number; width: number; height: number } 
 /** Menos de esto (en puntos) cuenta como un clic, no como un arrastre. */
 const MIN_DRAG = 8;
 
-export function Selector(props: { sourceWidth: number; sourceHeight: number; onDone: (selection: Selection) => void }) {
+export function Selector(props: {
+  sourceWidth: number;
+  sourceHeight: number;
+  /** La captura de fondo (`data:` URL), cuando la ventana no es transparente
+   * sobre la pantalla real (Linux: a pantalla completa). */
+  background?: string;
+  onDone: (selection: Selection) => void;
+}) {
   const size = signal<Size>({ width: 0, height: 0 });
   const start = signal<Point | null>(null);
   const end = signal<Point | null>(null);
@@ -88,6 +95,9 @@ export function Selector(props: { sourceWidth: number; sourceHeight: number; onD
       {...responder.panHandlers}
       onLayout={({ bounds }) => size.set(bounds.size)}
     >
+      {props.background ? (
+        <Image src={props.background} class="absolute inset-0" style={{ objectFit: "fill" }} />
+      ) : null}
       {dragging() ? (
         <>
           {/* Cuatro bandas oscuras alrededor de la región: la región queda nítida. */}

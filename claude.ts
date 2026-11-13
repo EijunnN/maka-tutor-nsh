@@ -3,8 +3,7 @@
 // conversación: cada `ask` escribe un mensaje de usuario por stdin y lee los
 // eventos línea a línea hasta el `result` del turno.
 import { spawn, type ChildProcess } from "process";
-
-export const MODEL = "claude-sonnet-5-5";
+import { cliModel, writeAll } from "./claude-io";
 
 const SYSTEM = [
   "Eres Maka Tutor, un tutor que enseña a partir de lo que el usuario tiene en pantalla.",
@@ -23,32 +22,63 @@ export class ClaudeSession {
   private child: ChildProcess | null = null;
   private pending: Pending | null = null;
   private stderr = "";
+  /** El modelo con el que se lanza el próximo proceso de `claude`. */
+  private model: string;
 
-  /** Pregunta `text`, con una captura JPEG en base64 opcional; `onDelta`
+  private system: string;
+  private systemFile: string | null;
+  private effort: string | null;
+
+  /** `system` sustituye al prompt del tutor (el modo reunión trae el suyo);
+   * `systemFile`, un archivo con el prompt (para prompts largos: la línea de
+   * comandos de Windows no pasa de ~32K caracteres);
+   * `effort` (`low`…`max`) acorta o alarga lo que piensa el modelo. */
+  constructor(model: string, options: { system?: string; systemFile?: string; effort?: string } = {}) {
+    this.model = model;
+    this.system = options.system ?? SYSTEM;
+    this.systemFile = options.systemFile ?? null;
+    this.effort = options.effort ?? null;
+  }
+
+  /** Hay una pregunta en curso. */
+  get busy() {
+    return this.pending !== null;
+  }
+
+  /** Cambia de modelo: el proceso en curso sigue con el anterior hasta
+   * `reset`, la siguiente ya usa este. */
+  setModel(model: string) {
+    this.model = model;
+  }
+
+  /** Pregunta `text`, con capturas JPEG en base64 (en orden); `onDelta`
    * recibe el texto según llega. Resuelve con la respuesta completa. */
-  ask(text: string, imageBase64: string | null, onDelta: (text: string) => void): Promise<string> {
+  ask(text: string, images: string[], onDelta: (text: string) => void): Promise<string> {
     if (this.pending) return Promise.reject(new Error("Ya hay una pregunta en curso"));
     const child = this.child ?? this.start();
-    const content: unknown[] = [];
-    if (imageBase64) {
-      content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } });
-    }
+    const content: unknown[] = images.map((data) => ({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data },
+    }));
     content.push({ type: "text", text });
+    const line = JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n";
     return new Promise<string>((resolve, reject) => {
       this.pending = { onDelta, resolve, reject, streamed: "" };
-      try {
-        child.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
-      } catch (error) {
+      writeAll(child, line).catch((error) => {
+        if (this.child !== child || !this.pending) return;
         this.pending = null;
         reject(error instanceof Error ? error : new Error(String(error)));
-      }
+      });
     });
   }
 
   /** Corta la respuesta en curso y la conversación. */
   reset() {
+    const pending = this.pending;
+    this.pending = null;
     this.child?.kill();
     this.child = null;
+    pending?.reject(new Error("Respuesta detenida."));
   }
 
   dispose() {
@@ -65,12 +95,13 @@ export class ClaudeSession {
         "--output-format", "stream-json",
         "--verbose",
         "--include-partial-messages",
-        "--model", MODEL,
+        "--model", cliModel(this.model),
         "--tools", "",
         // Sin CLAUDE.md, reglas, skills, plugins ni MCP del usuario: el
         // contexto baja de ~48k a ~3k tokens por conversación. (`--bare`
         // recortaría más pero exige ANTHROPIC_API_KEY y no usa el OAuth.)
-        "--system-prompt", SYSTEM,
+        ...(this.systemFile ? ["--system-prompt-file", this.systemFile] : ["--system-prompt", this.system]),
+        ...(this.effort ? ["--effort", this.effort] : []),
         "--setting-sources", "",
         "--strict-mcp-config",
         "--disable-slash-commands",
@@ -78,12 +109,16 @@ export class ClaudeSession {
       ],
       { stdin: "pipe", lines: true },
     );
-    child.on("stdout", (line) => this.handle(line));
+    // Un proceso ya reiniciado (`reset`) no toca la pregunta del siguiente.
+    child.on("stdout", (line) => {
+      if (this.child === child) this.handle(line);
+    });
     child.on("stderr", (text) => {
-      this.stderr = (this.stderr + text + "\n").slice(-4000);
+      if (this.child === child) this.stderr = (this.stderr + text + "\n").slice(-4000);
     });
     child.on("exit", (result) => {
-      if (this.child === child) this.child = null;
+      if (this.child !== child) return;
+      this.child = null;
       const pending = this.pending;
       this.pending = null;
       if (pending) {

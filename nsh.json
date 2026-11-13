@@ -3,6 +3,11 @@
   "id": "com.eijunnn.makatutornsh",
   "version": "0.1.0",
   "build": 1,
+  "appearance": "dark",
+  "updater": {
+    "github": "EijunnN/maka-tutor-nsh",
+    "publicKey": "uPGnT1tO4ibp+oTri/lCbKrt97fM3un252o1NCBHYkM="
+  },
   "rust": ".",
   "window": {
     "title": "Maka Tutor",
@@ -18,10 +23,11 @@
     "windows": { "kinds": ["normal", "popup", "overlay"], "overlay": true },
     "process": {
       "execute": ["claude"],
-      "env": ["APPDATA", "LOCALAPPDATA", "USERNAME", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"]
+      "env": ["APPDATA", "LOCALAPPDATA", "USERNAME", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"]
     },
     "fs": { "read": ["${dataDir}"], "write": ["${dataDir}"] },
     "clipboard": true,
+    "picker": true,
     "statusBar": true
   }
 }

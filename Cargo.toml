@@ -10,14 +10,31 @@ publish = false
 nsh-core = "0.5.0"
 nsh-base = "0.5.0"
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# WebSocket de Deepgram (TLS de Windows, SChannel).
+tungstenite = { version = "0.30", features = ["native-tls"] }
 
-# Captura de pantalla (GDI) y exclusión de capturas (SetWindowDisplayAffinity).
+# Captura (GDI), exclusión de capturas, claves (Credential Manager), arranque (Run),
+# audio del sistema (WASAPI) y lista de procesos.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    "Win32_Security_Credentials",
+    "Win32_System_Registry",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
 ] }
 windows-core = "0.62"
+
+# Linux: captura con X11 (x11rb, Rust puro) o, en Wayland, con el portal de
+# capturas del escritorio por D-Bus (zbus, Rust puro).
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["randr"] }
+zbus = "5"
