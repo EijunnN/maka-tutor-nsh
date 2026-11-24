@@ -123,9 +123,17 @@ function App() {
 
   // Fuera de capturas, grabaciones y screen sharing: al arrancar y cada vez que
   // aparece (por si la ventana se recrea).
-  const protect = () => protectedWindows.set(Screen.protect(true));
+  // Además se reaplica cada medio segundo: las ventanas que NSH crea o recrea
+  // después (el selector de región, el panel al salir de la bandeja) quedan
+  // excluidas casi al instante y nunca llegan a verse en Teams, Discord o Meet.
+  const protect = () => {
+    const count = Screen.protect(true);
+    if (count !== protectedWindows()) protectedWindows.set(count);
+  };
   setTimeout(protect, 0);
   win.on("focusChange", ({ focused }) => focused && protect());
+  const protectTimer = setInterval(protect, 500);
+  cleanup(() => clearInterval(protectTimer));
 
   // Cerrar oculta: la app sigue en la bandeja.
   win.on("closePress", () => win.hide());
@@ -224,6 +232,7 @@ function App() {
           closeOnEscape: true,
           activate: true,
         });
+    protect();
     // Escape (o cualquier otro cierre) cancela.
     selector.on("close", () => finish(null));
   };
