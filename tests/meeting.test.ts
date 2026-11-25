@@ -48,6 +48,10 @@ mock.module("maka-tutor-nsh/native", () => ({
 const asked: { prompt: string; images: string[]; system: string }[] = [];
 let sessionsCreated = 0;
 let release: (() => void)[] = [];
+/** Lo que Claude responde en la próxima pregunta. */
+let reply = "Propuesta";
+/** Calentamientos (`WARMUP`) recibidos: se resuelven solos y no cuentan en `asked`. */
+let warmups = 0;
 mock.module("../claude", () => ({
   ClaudeSession: class {
     constructor(
@@ -57,11 +61,16 @@ mock.module("../claude", () => ({
       sessionsCreated++;
     }
     ask(prompt: string, images: string[], onDelta: (t: string) => void) {
+      if (prompt.startsWith("La reunión aún no ha empezado")) {
+        warmups++;
+        return Promise.resolve("listo");
+      }
+      const text = reply;
       asked.push({ prompt, images, system: readFileSync(this.options.systemFile, "utf8") });
       return new Promise<string>((resolve) => {
         release.push(() => {
-          onDelta("Propuesta");
-          resolve("Propuesta");
+          onDelta(text);
+          resolve(text);
         });
       });
     }
@@ -91,6 +100,8 @@ beforeEach(() => {
   status = "listening";
   asked.length = 0;
   release = [];
+  reply = "Propuesta";
+  warmups = 0;
   picked = [];
   storage.clear();
 });
@@ -199,6 +210,9 @@ test("una captura va con su imagen y el contexto entra en el prompt de sistema",
   expect(asked[0].images).toEqual(["BASE64"]);
   expect(asked[0].prompt).toContain("captura de la pantalla compartida");
   expect(asked[0].system).toContain("Agenda: lanzamiento de la v2");
+  // Con contexto, el proceso lo leyó al empezar a escuchar.
+  expect(warmups).toBe(1);
+  expect(asked[0].prompt).toContain("El usuario pide tu sugerencia ahora");
   release.shift()!();
   await tick(10);
   m.stop();
@@ -367,4 +381,22 @@ test("sin micrófono, todo es de los demás y no se pide multichannel", async ()
   await tick(10);
   m.stop();
   m.setMicrophone(true);
+});
+
+test("sin contexto no se calienta; «—» deja la intervención sin sugerencia y quién eres va al prompt", async () => {
+  const m = new MeetingController(() => "claude-sonnet-5-5");
+  m.setMe("Darwin,   llevo el backend");
+  expect(storage.get("meeting.me")).toBe("Darwin, llevo el backend");
+  m.start(null, "es");
+  reply = "—";
+  queue.push(results("Ana, ¿viste el partido?", { speech_final: true }));
+  await tick(400);
+  expect(warmups).toBe(0);
+  expect(asked[0].system).toContain("Darwin, llevo el backend");
+  expect(asked[0].prompt).toContain("o «—» si no hay nada para el usuario");
+  release.shift()!();
+  await tick(10);
+  expect(m.turns()[0].answer()).toBe("");
+  expect(m.turns()[0].status()).toBe("done");
+  m.stop();
 });

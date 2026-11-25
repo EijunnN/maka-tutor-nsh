@@ -236,6 +236,23 @@ function Setup(props: { meeting: MeetingController }) {
           ) : null}
         </View>
 
+        {/* Quién eres */}
+        <View>
+          <Text class={caption}>Quién eres en la reunión</Text>
+          <View class={`${group} px-3.5 py-2.5`} style={glass}>
+            <Input
+              class="bg-transparent text-[13px] leading-5 text-black/85 dark:text-white/90"
+              value={m.me()}
+              onChange={({ value }) => m.setMe(value)}
+              placeholder="Tu nombre y tu papel: «Darwin, llevo el backend»"
+            />
+          </View>
+          <Text class={footer}>
+            Con esto Maka sabe cuándo te preguntan a ti. Si nadie te pide nada, no propone: pulsa «Sugerir respuesta» para
+            forzarlo. Se recuerda.
+          </Text>
+        </View>
+
         {/* Documentos */}
         <View>
           <View class="flex-row items-center justify-between pr-1">
@@ -273,7 +290,7 @@ function Setup(props: { meeting: MeetingController }) {
             {docError() ||
               (contextChars() > LARGE_CONTEXT_CHARS
                 ? `El contexto ocupa ${contextChars().toLocaleString("es")} caracteres: puede pasar del millón de tokens del modelo y entonces Claude no podrá responder. Quita algún documento.`
-                : `Van enteros, sin recortar, con cada respuesta (${contextChars().toLocaleString("es")} caracteres ahora). Se recuerdan entre reuniones; uno con el mismo nombre sustituye al anterior.`)}
+                : `Van enteros, sin recortar; Maka los lee al empezar a escuchar, antes de la primera pregunta (${contextChars().toLocaleString("es")} caracteres ahora). Se recuerdan entre reuniones; uno con el mismo nombre sustituye al anterior.`)}
           </Text>
         </View>
 
