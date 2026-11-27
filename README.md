@@ -14,7 +14,7 @@ NSH no trae de serie; el Maka Tutor de Electron sigue intacto en `../maka-tutor`
 | API key cifrada | Rust (`src/settings.rs`): Administrador de credenciales de Windows; la key nunca vuelve a JS, `ApiKey.load()` la pone en el entorno del proceso y NSH la pasa a `claude` (`ANTHROPIC_API_KEY` concedida) | ✓ test: guardar, leer, borrar |
 | Arranque con la sesión | Rust: valor en `HKCU\…\Run` con este ejecutable (en `nsh run` es el host de desarrollo: probarlo con la app empaquetada) | compila; probar a mano |
 | Audio del sistema | Rust (`src/audio.rs`): WASAPI loopback de una app y sus hijos (`ActivateAudioInterfaceAsync`, process loopback) o de todo el equipo; PCM s16 estéreo 48 kHz. Sin micrófono | ✓ test con tono real: equipo y proceso lo oyen, otro proceso no |
-| Modo reunión | Rust (`src/meeting.rs`): hilo captura → WebSocket de Deepgram Nova-3 (tungstenite + SChannel), reintentos, silencio de relleno, la app elegida vigilada; la clave de Deepgram no sale de Rust. JS (`meeting.ts`, `MeetingPage.tsx`, 🎙): Teams, Discord o cualquier app; documentos .md de contexto (se recuerdan; el prompt va por `--system-prompt-file`); intervenciones, respuestas de Claude de una en una (proceso persistente, `--effort low`), capturas y contexto pegado | ✓ tests de lógica (bun) y rechazo real de clave falsa; probar con una reunión |
+| Modo reunión | Rust (`src/meeting.rs`): hilo captura → WebSocket del streaming v3 de AssemblyAI (`assemblyai-stt-3-7-realtime`, mono a 16 kHz; tungstenite + SChannel), reintentos, silencio de relleno, la app elegida vigilada; la clave de AssemblyAI no sale de Rust. JS (`meeting.ts`, `MeetingPage.tsx`, pestaña «Reunión»): Teams, Discord o cualquier app; documentos .md de contexto (se recuerdan; el prompt va por `--system-prompt-file`); intervenciones, respuestas de Claude de una en una (proceso persistente, `--effort low`), capturas y contexto pegado | ✓ tests de lógica (bun) y rechazo real de clave falsa; probar con una reunión |
 | Fuera de capturas | Rust, `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` en todas las ventanas del proceso (`Screen.protect(true)`) | compila; probar a mano |
 | Claude sin Node | CLI `claude` en `stream-json` con `process.spawn` de NSH, imagen por stdin (`claude.ts`) | ✓ probado por CLI: streaming y visión |
 | Panel flotante | `level: "floating"`, sin barra de tareas, en todos los escritorios, arrastrable | probar a mano |
@@ -23,10 +23,12 @@ NSH no trae de serie; el Maka Tutor de Electron sigue intacto en `../maka-tutor`
 | Click-through | Modo fantasma: `pointerEvents: "none"` (permiso `windows.overlay`) | probar a mano |
 | Markdown en streaming | `TextView` de `nsh/base` con `streaming: true` (sustituye a react-markdown) | probar a mano |
 
-Quién habla (modo reunión): Deepgram separa las voces (`diarize=true`: «Hablante 1», «Hablante 2»…; se renombran
-tocando el nombre y Claude recibe el cambio) y, con «Incluir mi micrófono», el micrófono va en un canal propio
-(`multichannel=true`: canal 0 el usuario, canal 1 lo demás; `audio::start_with_microphone` los mezcla), así que lo
-que dice el usuario sale como «Tú», sin pedir respuesta. Claude responde a la última voz pendiente.
+Quién habla (modo reunión): AssemblyAI separa las voces en directo (`speaker_labels=true`: cada palabra trae su voz,
+`A`, `B`…, que la app muestra como «Hablante 1», «Hablante 2»…; quien interrumpe a mitad de turno sale en su propia
+burbuja; se renombran tocando el nombre y Claude recibe el cambio). Con «Incluir mi micrófono» van dos conexiones: la
+del micrófono (canal 0 de `audio::start_with_microphone`) sale como «Tú», sin pedir respuesta, y la del resto (canal 1)
+es la única que separa voces. Claude responde a la última voz pendiente. El idioma lo detecta AssemblyAI.
+Coste: 0,30 $/h más 0,12 $/h por separar voces, por conexión abierta.
 
 Varias capturas por pregunta (chat y reunión): cada captura se suma a las anteriores, hasta 10; el mensaje va a `claude` por trozos (`claude-io.ts`), porque el stdin de NSH deja esperar como mucho 1 MiB.
 
@@ -53,7 +55,7 @@ con otra: habría que instalar a mano una versión con la nueva `publicKey`.
 nsh run          # host de Windows con hot reload (la primera vez compila ~3 min)
 nsh check        # cargo check + tipos de App.tsx contra las declaraciones generadas
 cargo test       # tests de Rust (captura real del escritorio y de audio: suena un tono)
-cargo test -- --ignored        # + conexión real con Deepgram (clave falsa → rechazo)
+cargo test -- --ignored        # + conexión real con AssemblyAI (clave falsa → rechazo)
 bun test tests/meeting.test.ts # lógica del modo reunión, con Rust y Claude simulados
 nsh package --target windows
 ```

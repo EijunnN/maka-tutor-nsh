@@ -1,13 +1,15 @@
 //! `Meeting`: escucha de reuniones. Un hilo captura el audio (`audio`) y lo
-//! envía a Deepgram por WebSocket (Nova-3, parciales y fin de frase); los
-//! mensajes de Deepgram se acumulan y JS los recoge con `poll()` cada ~100 ms
-//! (`meeting.ts` los convierte en intervenciones). La clave de Deepgram se lee
-//! aquí, del Administrador de credenciales: nunca pasa por JS.
+//! envía a AssemblyAI por WebSocket (streaming v3: parciales, fin de turno y
+//! voces separadas en directo); los `Turn` se acumulan y JS los recoge con
+//! `poll()` cada ~100 ms (`meeting.ts` los convierte en intervenciones). La
+//! clave de AssemblyAI se lee aquí, del almacén de claves: nunca pasa por JS.
 //!
-//! Igual que en el Maka de Electron: tres reintentos de conexión sin reenviar
-//! audio viejo (lo que suena durante un corte se pierde y se avisa), 100 ms
-//! de silencio cuando WASAPI no entrega nada (para que Deepgram cierre la
-//! última frase) y parada si la app elegida se cierra o la red no da abasto.
+//! Con micrófono van dos conexiones: la del usuario (canal 0 de la captura) y
+//! la de los demás (canal 1), la única que separa voces. Tres reintentos de
+//! conexión sin reenviar audio viejo (lo que suena durante un corte se pierde
+//! y se avisa), silencio cuando WASAPI no entrega nada (para que AssemblyAI
+//! cierre el último turno) y parada si la app elegida se cierra o la red no
+//! da abasto.
 
 use crate::audio::{self, Target};
 use nsh_core::prelude::*;
@@ -32,7 +34,8 @@ pub struct Poll {
     pub message: String,
     /// Nivel del audio (0 a 1).
     pub level: f64,
-    /// Mensajes JSON de Deepgram llegados desde el último `poll()`, en orden.
+    /// Los `Turn` de AssemblyAI llegados desde el último `poll()`, en orden,
+    /// como `{"who":"me"|"others","msg":<Turn>}`.
     pub messages: Vec<String>,
     /// Se reconectó desde el último `poll()`: el texto a medias se perdió.
     pub reconnected: bool,
@@ -64,8 +67,6 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 
 /// Más mensajes sin recoger que esto: JS no está leyendo, se descartan los viejos.
 const MAX_PENDING: usize = 400;
-/// 100 ms de silencio en PCM s16 estéreo a 48 kHz.
-const SILENCE: usize = (audio::RATE as usize / 10) * audio::FRAME_BYTES;
 
 /// La escucha de reuniones.
 #[module]
@@ -78,12 +79,10 @@ impl Meeting {
     /// árbol.
     pub fn sources() -> Result<Vec<Source>, String> {
         let all = imp::processes()?;
-        let pattern = ["zoho", "chrome", "msedge", "firefox", "brave", "opera", "discord", "zoom", "teams"];
         let mut sources: Vec<Source> = all
             .iter()
             .filter(|p| {
-                let name = p.name.to_lowercase();
-                pattern.iter().any(|k| name.contains(k))
+                is_call_app(&p.name)
                     && !all.iter().any(|parent| parent.pid == p.parent && parent.name.eq_ignore_ascii_case(&p.name))
             })
             .map(|p| Source { pid: p.pid, name: p.name.clone() })
@@ -93,16 +92,13 @@ impl Meeting {
     }
 
     /// Empieza a escuchar `pid` (o todo el audio del equipo con `None`) y a
-    /// transcribir en `language` (`es`, `en` o `multi`). Detiene la escucha
-    /// anterior. Lanza si falta la clave o el idioma no es válido; los fallos
-    /// de captura o de red llegan por `poll()`.
-    /// Con `microphone`, también el micrófono, en su propio canal: lo que dice
-    /// el usuario llega aparte (canal 0).
-    pub fn start(pid: Option<u32>, language: String, microphone: bool) -> Result<(), String> {
-        if !["es", "en", "multi"].contains(&language.as_str()) {
-            return Err("idioma no válido".into());
-        }
-        let key = crate::settings::deepgram_key().ok_or("Guarda tu clave de Deepgram para transcribir.")?;
+    /// transcribir (el idioma lo detecta AssemblyAI). Detiene la escucha
+    /// anterior. Lanza si falta la clave; los fallos de captura o de red
+    /// llegan por `poll()`.
+    /// Con `microphone`, también el micrófono, en su propia conexión: lo que
+    /// dice el usuario llega aparte (`who: "me"`).
+    pub fn start(pid: Option<u32>, microphone: bool) -> Result<(), String> {
+        let key = crate::settings::transcription_key().ok_or("Guarda tu clave de AssemblyAI para transcribir.")?;
         if let Some(pid) = pid
             && !imp::alive(pid)
         {
@@ -119,7 +115,7 @@ impl Meeting {
             std::thread::Builder::new()
                 .name("maka-meeting".into())
                 .spawn(move || {
-                    let result = listen(target, microphone, &language, &key, &stop, &shared);
+                    let result = listen(target, microphone, &key, &stop, &shared);
                     stop.store(true, Ordering::SeqCst);
                     let mut s = shared.lock().unwrap();
                     s.level = 0.0;
@@ -144,7 +140,7 @@ impl Meeting {
         }
     }
 
-    /// El estado y los mensajes de Deepgram nuevos.
+    /// El estado y los `Turn` nuevos.
     pub fn poll() -> Poll {
         let Ok(session) = SESSION.lock() else {
             return Poll { status: "idle".into(), ..Default::default() };
@@ -163,41 +159,95 @@ impl Meeting {
     }
 }
 
+/// Si el proceso puede llevar una llamada: Teams, Zoom, Zoho, Discord o un
+/// navegador, sin sus procesos auxiliares (informes de fallos, ayudantes,
+/// WebView2, actualizadores), que no suenan y alargaban la lista.
+fn is_call_app(name: &str) -> bool {
+    let name = name.to_lowercase();
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    let apps = ["zoho", "chrome", "msedge", "firefox", "brave", "opera", "discord", "zoom", "teams"];
+    let helpers = ["crash", "helper", "webview", "update", "service", "elevation", "notification", "proxy"];
+    // «teams» al principio o tras un guion (`ms-teams`, `teams`): no `steamservice`.
+    let app = apps.iter().any(|k| if *k == "teams" { stem == "teams" || stem == "msteams" || stem.ends_with("-teams") } else { stem.contains(k) });
+    app && !helpers.iter().any(|k| stem.contains(k))
+}
+
 /// El pid del primer proceso con ese nombre (para los tests).
 #[allow(dead_code)]
 pub(crate) fn find_process(name: &str) -> Option<u32> {
     imp::processes().ok()?.into_iter().find(|p| p.name.eq_ignore_ascii_case(name)).map(|p| p.pid)
 }
 
-/// `diarize`: cada palabra trae el número de la voz que la dijo. Con
-/// `microphone`, el canal 0 es el micrófono y el 1 lo demás (`multichannel`:
-/// Deepgram los transcribe por separado).
-fn deepgram_url(language: &str, microphone: bool) -> String {
+/// El modelo de AssemblyAI: el de tiempo real, multilingüe (detecta español,
+/// inglés y otros 30 idiomas sin decírselo) y con voces separadas en directo.
+const MODEL: &str = "assemblyai-stt-3-7-realtime";
+/// AssemblyAI espera mono a 16 kHz; la captura da estéreo a 48 kHz.
+const RATE_OUT: u32 = 16_000;
+const DECIMATE: usize = (audio::RATE / RATE_OUT) as usize;
+/// Bytes de 100 ms de audio enviado (mono s16 a 16 kHz): cada mensaje lleva
+/// entre 20 ms y 1 s, o AssemblyAI cierra la sesión (3007).
+const CHUNK_100MS: usize = RATE_OUT as usize / 10 * 2;
+const MAX_CHUNK: usize = CHUNK_100MS * 10;
+
+/// Quién suena en una conexión: con micrófono, una para el usuario (`me`, sin
+/// separar voces) y otra para los demás (`others`, con `speaker_labels`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Who {
+    Me,
+    Others,
+}
+
+impl Who {
+    fn name(self) -> &'static str {
+        match self {
+            Who::Me => "me",
+            Who::Others => "others",
+        }
+    }
+}
+
+fn assemblyai_url(who: Who) -> String {
     format!(
-        "wss://api.deepgram.com/v1/listen?model=nova-3&language={language}&encoding=linear16&sample_rate={}&channels={}\
-         &interim_results=true&punctuate=true&smart_format=true&endpointing=400&utterance_end_ms=1000&diarize=true{}",
-        audio::RATE,
-        audio::CHANNELS,
-        if microphone { "&multichannel=true" } else { "" }
+        "wss://streaming.assemblyai.com/v3/ws?speech_model={MODEL}&encoding=pcm_s16le&sample_rate={RATE_OUT}&speaker_labels={}",
+        who == Who::Others
     )
 }
 
 type Socket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
 
-fn connect(language: &str, microphone: bool, key: &str) -> Result<Socket, String> {
+/// Un error que no se arregla reintentando (clave, saldo).
+fn fatal(error: &str) -> bool {
+    error.starts_with("AssemblyAI rechazó") || error.starts_with("Tu cuenta")
+}
+
+/// Lo que dice un `Error` (o el cierre) de AssemblyAI, para el usuario.
+fn describe_error(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if lower.contains("insufficient funds") || lower.contains("metronome") {
+        "Tu cuenta de AssemblyAI no tiene saldo.".into()
+    } else if lower.contains("api key") || lower.contains("unauthorized") || lower.contains("authorization") {
+        "AssemblyAI rechazó la clave. Revísala en el panel de reunión.".into()
+    } else {
+        format!("AssemblyAI cortó la transcripción: {text}")
+    }
+}
+
+/// Conecta y espera el `Begin`: una clave mala se acepta al conectar y se
+/// rechaza justo después con un `Error`.
+fn connect(who: Who, key: &str) -> Result<Socket, String> {
+    use tungstenite::Message;
     use tungstenite::client::IntoClientRequest;
-    let mut request = deepgram_url(language, microphone).into_client_request().map_err(|e| e.to_string())?;
+    let mut request = assemblyai_url(who).into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert(
         "Authorization",
-        format!("Token {key}").parse().map_err(|_| "la clave de Deepgram tiene caracteres no válidos")?,
+        key.parse().map_err(|_| "la clave de AssemblyAI tiene caracteres no válidos")?,
     );
     let (mut socket, _) = tungstenite::connect(request).map_err(|e| match e {
         tungstenite::Error::Http(response) => match response.status().as_u16() {
-            401 | 403 => "Deepgram rechazó la clave. Revísala en el panel de reunión.".to_string(),
-            402 => "Tu cuenta de Deepgram no tiene saldo.".to_string(),
-            code => format!("Deepgram rechazó la conexión ({code})."),
+            401 | 403 => "AssemblyAI rechazó la clave. Revísala en el panel de reunión.".to_string(),
+            code => format!("AssemblyAI rechazó la conexión ({code})."),
         },
-        other => format!("No se pudo conectar con Deepgram: {other}"),
+        other => format!("No se pudo conectar con AssemblyAI: {other}"),
     })?;
     // Lecturas con tope corto: el mismo hilo lee y envía audio.
     let tcp = match socket.get_mut() {
@@ -207,7 +257,75 @@ fn connect(language: &str, microphone: bool, key: &str) -> Result<Socket, String
     };
     tcp.set_read_timeout(Some(Duration::from_millis(15))).map_err(|e| e.to_string())?;
     tcp.set_nodelay(true).ok();
-    Ok(socket)
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        match socket.read() {
+            Ok(Message::Text(text)) if text.contains(r#""type":"Begin""#) => return Ok(socket),
+            Ok(Message::Text(text)) if text.contains(r#""type":"Error""#) => return Err(describe_error(&text)),
+            Ok(Message::Close(frame)) => {
+                return Err(frame.map_or("AssemblyAI cerró la conexión.".into(), |f| describe_error(&f.reason)));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => return Err(format!("No se pudo conectar con AssemblyAI: {e}")),
+        }
+    }
+    Err("AssemblyAI no respondió al conectar.".into())
+}
+
+/// Una conexión, con lo que aún no se le ha enviado y el diezmado en curso.
+struct Link {
+    who: Who,
+    socket: Socket,
+    /// PCM mono s16le a 16 kHz pendiente de enviar.
+    out: Vec<u8>,
+    /// Suma y cuenta de las muestras a 48 kHz de la muestra a 16 kHz en curso.
+    acc: (i32, usize),
+}
+
+impl Link {
+    fn new(who: Who, socket: Socket) -> Self {
+        Link { who, socket, out: Vec::new(), acc: (0, 0) }
+    }
+
+    fn push(&mut self, sample: i16) {
+        if let Some(value) = decimate(&mut self.acc, sample) {
+            self.out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Envía lo pendiente en trozos de 100 ms a 1 s. `Err` si la conexión cayó.
+    fn flush(&mut self) -> Result<(), ()> {
+        while self.out.len() >= CHUNK_100MS {
+            let take = self.out.len().min(MAX_CHUNK) / 2 * 2;
+            let chunk: Vec<u8> = self.out.drain(..take).collect();
+            match self.socket.send(tungstenite::Message::binary(chunk)) {
+                Ok(()) => {}
+                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(())
+    }
+
+    fn close(mut self) {
+        let _ = self.socket.send(tungstenite::Message::text(r#"{"type":"Terminate"}"#));
+        let _ = self.socket.close(None);
+    }
+}
+
+/// Una muestra a 48 kHz más; cada tres, su media, a 16 kHz (filtro de caja:
+/// basta para voz, que apenas tiene energía por encima de 8 kHz).
+fn decimate(acc: &mut (i32, usize), sample: i16) -> Option<i16> {
+    acc.0 += sample as i32;
+    acc.1 += 1;
+    if acc.1 < DECIMATE {
+        return None;
+    }
+    let value = (acc.0 / DECIMATE as i32) as i16;
+    *acc = (0, 0);
+    Some(value)
 }
 
 /// Por qué se dejó de usar una conexión.
@@ -218,16 +336,9 @@ enum Drop {
     Done(Result<(), String>),
 }
 
-fn listen(
-    target: Target,
-    microphone: bool,
-    language: &str,
-    key: &str,
-    stop: &AtomicBool,
-    shared: &Mutex<Shared>,
-) -> Result<(), String> {
+fn listen(target: Target, microphone: bool, key: &str, stop: &AtomicBool, shared: &Mutex<Shared>) -> Result<(), String> {
     // La captura primero: si la app no admite captura, falla antes de gastar
-    // conexión con Deepgram.
+    // conexión con AssemblyAI.
     let stop_capture = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel();
     let started = if microphone {
@@ -245,30 +356,38 @@ fn listen(
         }
     })?;
     let _stop_capture = StopOnDrop(stop_capture);
+    let whos: &[Who] = if microphone { &[Who::Me, Who::Others] } else { &[Who::Others] };
 
     let mut retries = 0u32;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let mut socket = match connect(language, microphone, key) {
-            Ok(socket) => socket,
-            // Clave o saldo: no tiene sentido reintentar.
-            Err(e) if e.starts_with("Deepgram rechazó") || e.starts_with("Tu cuenta") => return Err(e),
-            Err(e) if retries >= 3 => return Err(e),
-            Err(_) => {
-                retries += 1;
-                backoff(retries, stop, shared, &rx);
-                continue;
+        let mut links = Vec::new();
+        let mut failed = None;
+        for &who in whos {
+            match connect(who, key) {
+                Ok(socket) => links.push(Link::new(who, socket)),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
             }
-        };
+        }
+        if let Some(e) = failed {
+            links.into_iter().for_each(Link::close);
+            if fatal(&e) || retries >= 3 {
+                return Err(e);
+            }
+            retries += 1;
+            backoff(retries, stop, shared, &rx);
+            continue;
+        }
         shared.lock().unwrap().set("listening", "Escuchando");
-        match pump(&mut socket, target, &rx, stop, shared) {
-            Drop::Done(result) => {
-                let _ = socket.send(tungstenite::Message::text(r#"{"type":"CloseStream"}"#));
-                let _ = socket.close(None);
-                return result;
-            }
+        let result = pump(&mut links, microphone, target, &rx, stop, shared);
+        links.into_iter().for_each(Link::close);
+        match result {
+            Drop::Done(result) => return result,
             Drop::Lost => {
                 retries += 1;
                 if retries > 3 {
@@ -293,9 +412,28 @@ fn backoff(retries: u32, stop: &AtomicBool, shared: &Mutex<Shared>, rx: &Receive
     }
 }
 
-/// Envía audio y recoge mensajes hasta que la conexión cae o la escucha acaba.
+/// Reparte un trozo estéreo s16le a 48 kHz entre las conexiones: con
+/// micrófono, el canal 0 a la del usuario y el 1 a la de los demás; sin él,
+/// la media de los dos a la única.
+fn split(pcm: &[u8], microphone: bool, links: &mut [Link]) {
+    for frame in pcm.chunks_exact(audio::FRAME_BYTES) {
+        let l = i16::from_le_bytes([frame[0], frame[1]]);
+        let r = i16::from_le_bytes([frame[2], frame[3]]);
+        for link in links.iter_mut() {
+            let sample = match (microphone, link.who) {
+                (true, Who::Me) => l,
+                (true, Who::Others) => r,
+                (false, _) => ((l as i32 + r as i32) / 2) as i16,
+            };
+            link.push(sample);
+        }
+    }
+}
+
+/// Envía audio y recoge mensajes hasta que una conexión cae o la escucha acaba.
 fn pump(
-    socket: &mut Socket,
+    links: &mut [Link],
+    microphone: bool,
     target: Target,
     rx: &Receiver<Result<Vec<u8>, String>>,
     stop: &AtomicBool,
@@ -305,12 +443,11 @@ fn pump(
     let mut last_audio = Instant::now();
     let mut last_silence = Instant::now();
     let mut last_check = Instant::now();
-    let mut unsent = 0usize;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Drop::Done(Ok(()));
         }
-        // Audio: todo lo que haya, en un mensaje.
+        // Audio: todo lo que haya.
         let mut pcm = Vec::new();
         match rx.recv_timeout(Duration::from_millis(30)) {
             Ok(Ok(chunk)) => pcm.extend(chunk),
@@ -330,48 +467,54 @@ fn pump(
         if !pcm.is_empty() {
             last_audio = now;
             shared.lock().unwrap().level = audio::level(&pcm);
+            split(&pcm, microphone, links);
         } else if now - last_audio > Duration::from_millis(200) && now - last_silence >= Duration::from_millis(100) {
             // WASAPI no entrega nada sin sonido: el silencio mantiene el reloj
-            // de Deepgram y le deja cerrar la última frase.
+            // de AssemblyAI y le deja cerrar el último turno.
             last_silence = now;
-            pcm = vec![0; SILENCE];
             shared.lock().unwrap().level = 0.0;
-        }
-        if !pcm.is_empty() {
-            unsent += pcm.len();
-            match socket.send(Message::binary(pcm)) {
-                Ok(()) => unsent = 0,
-                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return Drop::Lost,
+            for link in links.iter_mut() {
+                link.out.resize(link.out.len() + CHUNK_100MS, 0);
             }
-            // Más de dos segundos de audio sin poder enviarse: la red no da abasto.
-            if unsent > 2 * audio::RATE as usize * audio::FRAME_BYTES {
+        }
+        for link in links.iter_mut() {
+            if link.flush().is_err() {
+                return Drop::Lost;
+            }
+            // Más de dos segundos sin poder enviarse: la red no da abasto.
+            if link.out.len() > 20 * CHUNK_100MS {
                 return Drop::Done(Err("La conexión es demasiado lenta para audio en directo. Se detuvo la escucha.".into()));
             }
         }
 
-        // Mensajes de Deepgram.
-        loop {
-            match socket.read() {
-                Ok(Message::Text(text)) => {
-                    if text.contains(r#""type":"Error""#) {
-                        return Drop::Done(Err("Deepgram no pudo transcribir el audio. Revisa tu configuración.".into()));
+        // Mensajes de AssemblyAI: los `Turn` van a JS, con quién suena.
+        for link in links.iter_mut() {
+            loop {
+                match link.socket.read() {
+                    Ok(Message::Text(text)) => {
+                        if text.contains(r#""type":"Error""#) {
+                            let error = describe_error(&text);
+                            return if fatal(&error) { Drop::Done(Err(error)) } else { Drop::Lost };
+                        }
+                        if !text.contains(r#""type":"Turn""#) {
+                            continue;
+                        }
+                        let mut s = shared.lock().unwrap();
+                        s.messages.push(format!(r#"{{"who":"{}","msg":{}}}"#, link.who.name(), text.as_str()));
+                        if s.messages.len() > MAX_PENDING {
+                            let extra = s.messages.len() - MAX_PENDING;
+                            s.messages.drain(..extra);
+                        }
                     }
-                    let mut s = shared.lock().unwrap();
-                    s.messages.push(text.to_string());
-                    if s.messages.len() > MAX_PENDING {
-                        let extra = s.messages.len() - MAX_PENDING;
-                        s.messages.drain(..extra);
+                    Ok(Message::Close(_)) => return Drop::Lost,
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                    {
+                        break;
                     }
+                    Err(_) => return Drop::Lost,
                 }
-                Ok(Message::Close(_)) => return Drop::Lost,
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(e))
-                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
-                {
-                    break;
-                }
-                Err(_) => return Drop::Lost,
             }
         }
 
@@ -481,30 +624,62 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{Meeting, deepgram_url, imp};
+    use super::{CHUNK_100MS, Who, assemblyai_url, decimate, describe_error, fatal, imp, is_call_app};
+
+    #[test]
+    fn la_lista_de_apps_deja_fuera_los_ayudantes() {
+        for name in ["ms-teams.exe", "Teams.exe", "Discord.exe", "chrome.exe", "msedge.exe", "brave.exe", "Zoom.exe", "firefox"] {
+            assert!(is_call_app(name), "{name}");
+        }
+        for name in [
+            "steamservice.exe",
+            "BraveCrashHandler.exe",
+            "BraveCrashHandler64.exe",
+            "DiscordSystemHelper.exe",
+            "msedgewebview2.exe",
+            "GoogleUpdate.exe",
+            "notepad.exe",
+        ] {
+            assert!(!is_call_app(name), "{name}");
+        }
+    }
 
     #[test]
     fn la_url_pide_lo_que_entrega_la_captura() {
-        let url = deepgram_url("es", false);
-        assert!(url.starts_with("wss://api.deepgram.com/v1/listen?model=nova-3&language=es"));
-        assert!(url.contains("encoding=linear16&sample_rate=48000&channels=2"));
-        assert!(url.contains("interim_results=true") && url.contains("utterance_end_ms=1000"));
-        assert!(url.contains("diarize=true") && !url.contains("multichannel"));
-        assert!(deepgram_url("en", true).ends_with("&diarize=true&multichannel=true"));
+        let others = assemblyai_url(Who::Others);
+        assert!(others.starts_with("wss://streaming.assemblyai.com/v3/ws?speech_model=assemblyai-stt-3-7-realtime"));
+        assert!(others.contains("encoding=pcm_s16le&sample_rate=16000"));
+        assert!(others.ends_with("speaker_labels=true"));
+        // La voz del usuario no se separa: es una sola.
+        assert!(assemblyai_url(Who::Me).ends_with("speaker_labels=false"));
+    }
+
+    #[test]
+    fn los_errores_de_clave_y_saldo_no_se_reintentan() {
+        let key = describe_error(r#"{"type":"Error","error_code":1008,"error":"Unauthorized Connection: Invalid API key"}"#);
+        assert!(key.starts_with("AssemblyAI rechazó la clave") && fatal(&key), "{key}");
+        let money = describe_error("Insufficient funds");
+        assert!(money.starts_with("Tu cuenta") && fatal(&money), "{money}");
+        assert!(!fatal(&describe_error("Session Expired: Maximum session duration exceeded")));
     }
 
     // Red real: `cargo test -- --ignored`. Una clave falsa debe llegar a
-    // Deepgram por TLS y ser rechazada con un mensaje claro.
+    // AssemblyAI por TLS y ser rechazada con un mensaje claro.
     #[test]
     #[ignore]
-    fn deepgram_rechaza_una_clave_falsa() {
-        let error = super::connect("es", true, "0000000000000000000000000000000000000000").err().expect("rechazo");
-        assert!(error.starts_with("Deepgram rechazó la clave"), "{error}");
+    fn assemblyai_rechaza_una_clave_falsa() {
+        let error = super::connect(Who::Others, "00000000000000000000000000000000").err().expect("rechazo");
+        assert!(error.starts_with("AssemblyAI rechazó la clave"), "{error}");
     }
 
     #[test]
-    fn rechaza_idiomas_desconocidos() {
-        assert!(Meeting::start(None, "klingon".into(), false).is_err());
+    fn el_audio_sale_en_mono_a_16_khz_y_en_trozos_validos() {
+        let mut acc = (0, 0);
+        let out: Vec<i16> = [3, 6, 9, -3, -3, -3, 7].iter().filter_map(|&x| decimate(&mut acc, x)).collect();
+        assert_eq!(out, vec![6, -3]);
+        assert_eq!(acc, (7, 1), "la muestra suelta espera a las dos siguientes");
+        // 100 ms a 16 kHz, mono s16: 3200 bytes, dentro de los 20 ms – 1 s que admite.
+        assert_eq!(CHUNK_100MS, 3200);
     }
 
     #[cfg(any(windows, target_os = "linux"))]

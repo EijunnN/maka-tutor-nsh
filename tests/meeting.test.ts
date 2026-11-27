@@ -1,5 +1,5 @@
 // La lógica de `meeting.ts` sin NSH: `bun test tests/meeting.test.ts`.
-// Simula Rust (`Meeting.poll`) y Claude; no prueba la captura ni Deepgram.
+// Simula Rust (`Meeting.poll`) y Claude; no prueba la captura ni AssemblyAI.
 import { beforeEach, expect, mock, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -81,15 +81,19 @@ mock.module("../claude", () => ({
 
 const { MeetingController, Transcript } = await import("../meeting");
 
-/** Lo que dicen los demás: canal 1 (con el micrófono, que va por defecto, el 0 es el usuario). */
-const results = (text: string, extra: Record<string, unknown> = {}) =>
-  JSON.stringify({
-    type: "Results",
-    start: Math.random(),
-    duration: 1,
-    is_final: true,
-    channel_index: [1, 2],
-    channel: { alternatives: [{ transcript: text }] },
+let turnOrder = 0;
+/** Un `Turn` cerrado de AssemblyAI, como lo entrega `Meeting.poll` (`who`: de qué conexión). */
+const turn = (text: string, extra: Record<string, unknown> = {}, who = "others") => ({
+  who,
+  msg: { type: "Turn", turn_order: turnOrder++, end_of_turn: true, turn_is_formatted: true, transcript: text, ...extra },
+});
+/** Lo que dicen los demás, ya como texto (lo que lee `poll`). */
+const results = (text: string, extra: Record<string, unknown> = {}) => JSON.stringify(turn(text, { speaker_label: "A", ...extra }));
+/** Un turno de los demás con la voz de cada palabra (`speaker_labels`). */
+const words = (list: [string, string][], extra: Record<string, unknown> = {}) =>
+  turn(list.map(([w]) => w).join(" "), {
+    speaker_label: list[0]?.[1],
+    words: list.map(([text, speaker]) => ({ text, speaker, word_is_final: true })),
     ...extra,
   });
 
@@ -106,67 +110,72 @@ beforeEach(() => {
   storage.clear();
 });
 
-test("Transcript junta segmentos hasta speech_final y deduplica", () => {
+test("Transcript: el parcial se ve al momento y el turno sale al cerrarse, una sola vez", () => {
   const t = new Transcript();
-  const seg = { type: "Results", start: 0, duration: 1, is_final: true, channel: { alternatives: [{ transcript: "Hola" }] } };
-  expect(t.accept(seg)).toEqual([]);
-  expect(t.accept(seg)).toEqual([]); // repetido
-  expect(t.accept({ ...seg, is_final: false, start: 1, channel: { alternatives: [{ transcript: "qué tal" }] } })).toEqual([]);
-  expect(t.preview).toBe("Hola qué tal");
-  expect(t.accept({ ...seg, start: 1, speech_final: true, channel: { alternatives: [{ transcript: "qué tal" }] } })).toEqual([
-    { speaker: "v0", text: "Hola qué tal" },
-  ]);
+  const partial = { who: "others", msg: { type: "Turn", turn_order: 7, end_of_turn: false, transcript: "hola qué" } };
+  expect(t.accept(partial)).toEqual([]);
+  expect(t.preview).toBe("hola qué");
+  const closed = { who: "others", msg: { type: "Turn", turn_order: 7, end_of_turn: true, transcript: "Hola, ¿qué tal?", speaker_label: "B" } };
+  expect(t.accept(closed)).toEqual([{ speaker: "v1", text: "Hola, ¿qué tal?" }]);
   expect(t.preview).toBe("");
-  expect(t.accept({ type: "UtteranceEnd" })).toEqual([]);
+  expect(t.accept(closed)).toEqual([]); // repetido
+  expect(t.accept({ type: "Turn" })).toEqual([]); // sin `who`/`msg`: no es de `poll`
 });
 
-/** Un resultado final de Deepgram con palabras y voces (`diarize`). */
-const words = (list: [string, number][], extra: Record<string, unknown> = {}) => ({
-  type: "Results",
-  start: Math.random(),
-  duration: 1,
-  is_final: true,
-  channel: {
-    alternatives: [
-      { transcript: list.map(([w]) => w).join(" "), words: list.map(([w, speaker]) => ({ word: w.toLowerCase(), punctuated_word: w, speaker })) },
-    ],
-  },
-  ...extra,
-});
-
-test("Transcript parte por voz: cada tramo seguido de la misma voz es una intervención", () => {
+test("Transcript parte por voz: quien interrumpe a mitad de turno sale aparte", () => {
   const t = new Transcript();
-  expect(t.accept(words([["¿Cuándo", 0], ["sale?", 0], ["Mañana.", 1], ["Vale,", 0], ["gracias.", 0]], { speech_final: true }))).toEqual([
+  expect(t.accept(words([["¿Cuándo", "A"], ["sale?", "A"], ["Mañana.", "B"], ["Vale,", "A"], ["gracias.", "A"]]))).toEqual([
     { speaker: "v0", text: "¿Cuándo sale?" },
     { speaker: "v1", text: "Mañana." },
     { speaker: "v0", text: "Vale, gracias." },
   ]);
 });
 
-test("Transcript con micrófono: el canal 0 es «Tú» y cada canal cierra lo suyo", () => {
-  const t = new Transcript(true);
-  expect(t.accept(words([["Yo", 0], ["lo", 0], ["reviso.", 0]], { channel_index: [0, 2] }))).toEqual([]);
-  expect(t.accept(words([["¿Y", 0], ["el", 0], ["precio?", 0]], { channel_index: [1, 2], speech_final: true }))).toEqual([
-    { speaker: "v0", text: "¿Y el precio?" },
+test("Transcript: una palabra suelta de otra voz entre dos tramos de la misma se queda con ellos", () => {
+  const t = new Transcript();
+  expect(t.accept(words([["Bueno,", "B"], ["les", "B"], ["cuento", "B"], ["cómo", "A"], ["vamos.", "B"]]))).toEqual([
+    { speaker: "v1", text: "Bueno, les cuento cómo vamos." },
   ]);
-  // El micrófono sigue pendiente hasta su propio fin de frase.
-  expect(t.preview).toBe("Yo lo reviso.");
-  expect(t.accept({ type: "UtteranceEnd", channel: [0, 2] })).toEqual([{ speaker: "me", text: "Yo lo reviso." }]);
+  // Dos palabras sí son una interrupción.
+  expect(t.accept(words([["Vamos", "A"], ["bien.", "A"], ["¿Seguro", "B"], ["que?", "B"], ["Sí.", "A"]]))).toEqual([
+    { speaker: "v0", text: "Vamos bien." },
+    { speaker: "v1", text: "¿Seguro que?" },
+    { speaker: "v0", text: "Sí." },
+  ]);
+});
+
+test("Transcript: una palabra sin voz aún (PENDING, UNKNOWN) se queda con la de al lado", () => {
+  const t = new Transcript();
+  expect(t.accept(words([["Sí,", "PENDING"], ["claro.", "B"]], { speaker_label: "B" }))).toEqual([{ speaker: "v1", text: "Sí, claro." }]);
+  expect(t.accept(words([["Bien", "A"], ["dicho.", "UNKNOWN"]], { speaker_label: "A" }))).toEqual([{ speaker: "v0", text: "Bien dicho." }]);
+  // Un turno corto sin voz: la última que habló.
+  expect(t.accept(turn("Ajá.", { speaker_label: "UNKNOWN" }))).toEqual([{ speaker: "v0", text: "Ajá." }]);
+});
+
+test("Transcript con micrófono: lo de su conexión es «Tú», con su propio parcial", () => {
+  const t = new Transcript();
+  expect(t.accept({ who: "me", msg: { type: "Turn", turn_order: 0, end_of_turn: false, transcript: "yo lo" } })).toEqual([]);
+  expect(t.accept({ who: "others", msg: { type: "Turn", turn_order: 0, end_of_turn: false, transcript: "y el precio" } })).toEqual([]);
+  expect(t.preview).toBe("y el precio · yo lo");
+  // Cada conexión numera sus turnos: el 0 de una no tapa el 0 de la otra.
+  expect(t.accept(turn("¿Y el precio?", { turn_order: 0, speaker_label: "A" }))).toEqual([{ speaker: "v0", text: "¿Y el precio?" }]);
+  expect(t.accept(turn("Yo lo reviso.", { turn_order: 0 }, "me"))).toEqual([{ speaker: "me", text: "Yo lo reviso." }]);
+  expect(t.preview).toBe("");
 });
 
 test("responde de una en una y junta lo que llega mientras tanto", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
-  m.start(null, "es");
-  queue.push(results("¿Cuándo sale la versión?", { speech_final: true }));
+  m.start(null);
+  queue.push(results("¿Cuándo sale la versión?"));
   await tick(400); // poll + 250 ms de espera
   expect(asked.length).toBe(1);
   expect(asked[0].prompt).toContain("«¿Cuándo sale la versión?»");
   expect(m.turns()[0].status()).toBe("answering");
 
   // Dos intervenciones mientras responde: se juntan en una pendiente.
-  queue.push(results("Y el precio", { speech_final: true }));
+  queue.push(results("Y el precio"));
   await tick(150);
-  queue.push(results("también.", { speech_final: true }));
+  queue.push(results("también."));
   await tick(150);
   expect(m.turns().length).toBe(2);
   expect(m.turns()[1].text).toBe("Y el precio también.");
@@ -188,8 +197,8 @@ test("responde de una en una y junta lo que llega mientras tanto", async () => {
 test("sin respuesta automática espera a «Sugerir respuesta»", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
   m.setAutoAnswer(false);
-  m.start(null, "en");
-  queue.push(results("Any questions?", { speech_final: true }));
+  m.start(null);
+  queue.push(results("Any questions?"));
   await tick(400);
   expect(asked.length).toBe(0);
   m.suggest();
@@ -203,7 +212,7 @@ test("sin respuesta automática espera a «Sugerir respuesta»", async () => {
 test("una captura va con su imagen y el contexto entra en el prompt de sistema", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
   m.setContext("Agenda: lanzamiento de la v2");
-  m.start(null, "es");
+  m.start(null);
   await tick(150);
   m.submit("", [{ data: "BASE64", width: 10, height: 10, sourceWidth: 1920, sourceHeight: 1080, sourceX: 0, sourceY: 0 }]);
   await tick(10);
@@ -220,7 +229,7 @@ test("una captura va con su imagen y el contexto entra en el prompt de sistema",
 
 test("un error de Rust detiene el sondeo y queda visible", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
-  m.start(null, "es");
+  m.start(null);
   status = "error";
   await tick(150);
   expect(m.status()).toBe("error");
@@ -246,8 +255,8 @@ test("los .md adjuntos van al prompt de sistema, se recuerdan y se quitan", asyn
   const big = "Inicio. " + "dato ".repeat(600_000) + "FINAL-DEL-DOCUMENTO";
   picked = [md("largo.md", big)];
   await m.attachDocs();
-  m.start(null, "es");
-  queue.push(results("¿Cuánto cuesta?", { speech_final: true }));
+  m.start(null);
+  queue.push(results("¿Cuánto cuesta?"));
   await tick(400);
   expect(asked[0].system).toContain('<documento nombre="producto.md">');
   expect(asked[0].system).toContain("Precio: 25 €/mes");
@@ -288,10 +297,10 @@ test("rechaza archivos que no son .md", async () => {
 
 test("una reunión larga usa un solo proceso y no repite ni salta intervenciones", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
-  m.start(null, "es");
+  m.start(null);
   const before = sessionsCreated;
   for (let i = 1; i <= 25; i++) {
-    queue.push(results(`Intervención ${i}.`, { speech_final: true }));
+    queue.push(results(`Intervención ${i}.`));
     await tick(400);
     expect(asked.length).toBe(i);
     release.shift()!();
@@ -309,7 +318,7 @@ test("una reunión larga usa un solo proceso y no repite ni salta intervenciones
 
 test("varias capturas van juntas, en orden, en una sola intervención", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
-  m.start(null, "es");
+  m.start(null);
   await tick(150);
   const shot = (data: string) => ({ data, width: 10, height: 10, sourceWidth: 1920, sourceHeight: 1080, sourceX: 0, sourceY: 0 });
   m.submit("¿Qué cambia entre estas?", [shot("UNO"), shot("DOS"), shot("TRES")]);
@@ -325,18 +334,18 @@ test("varias capturas van juntas, en orden, en una sola intervención", async ()
 
 test("con voces y micrófono: «Tú» es contexto, cada voz con su etiqueta y los renombres llegan a Claude", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
-  m.start(null, "es");
-  expect(started.at(-1)).toEqual([null, "es", true]);
-  const msg = (list: [string, number][], channel: number) =>
-    JSON.stringify({ ...words(list, { speech_final: true }), channel_index: [channel, 2] });
+  m.start(null);
+  expect(started.at(-1)).toEqual([null, true]);
+  const msg = (list: [string, string][], who: "me" | "others") =>
+    JSON.stringify(who === "me" ? turn(list.map(([w]) => w).join(" "), {}, "me") : words(list));
   // El usuario habla: queda como «Tú», sin pedir respuesta.
-  queue.push(msg([["Os", 0], ["paso", 0], ["el", 0], ["informe.", 0]], 0));
+  queue.push(msg([["Os", ""], ["paso", ""], ["el", ""], ["informe.", ""]], "me"));
   await tick(400);
   expect(asked.length).toBe(0);
   expect(m.turns()[0].speaker).toBe("me");
   expect(m.speakerLabel("me")).toBe("Tú");
   // Dos voces de los demás en la misma frase: dos intervenciones; se responde a la última.
-  queue.push(msg([["Gracias.", 0], ["¿Cuánto", 1], ["cuesta?", 1]], 1));
+  queue.push(msg([["Gracias.", "A"], ["¿Cuánto", "B"], ["cuesta?", "B"]], "others"));
   await tick(400);
   expect(m.turns().map((t) => [t.speaker, t.text])).toEqual([
     ["me", "Os paso el informe."],
@@ -354,13 +363,13 @@ test("con voces y micrófono: «Tú» es contexto, cada voz con su etiqueta y lo
   // Renombrar: la etiqueta cambia y Claude recibe la nota en la siguiente petición.
   m.rename("v1", "Ana");
   expect(m.speakerLabel("v1")).toBe("Ana");
-  queue.push(msg([["¿Y", 1], ["el", 1], ["plazo?", 1]], 1));
+  queue.push(msg([["¿Y", "B"], ["el", "B"], ["plazo?", "B"]], "others"));
   await tick(400);
   expect(asked[1].prompt).toContain("Nota: la voz que aparecía como «Hablante 2» es Ana.");
   expect(asked[1].prompt).toContain("Ana: «¿Y el plazo?»");
   release.shift()!();
   await tick(50);
-  queue.push(msg([["Perfecto.", 1]], 1));
+  queue.push(msg([["Perfecto.", "B"]], "others"));
   await tick(400);
   expect(asked[2].prompt).not.toContain("Nota:"); // ya la sabe
   release.shift()!();
@@ -368,12 +377,12 @@ test("con voces y micrófono: «Tú» es contexto, cada voz con su etiqueta y lo
   m.stop();
 });
 
-test("sin micrófono, todo es de los demás y no se pide multichannel", async () => {
+test("sin micrófono, todo es de los demás y Rust abre una sola conexión", async () => {
   const m = new MeetingController(() => "claude-sonnet-5-5");
   m.setMicrophone(false);
-  m.start(null, "en");
-  expect(started.at(-1)).toEqual([null, "en", false]);
-  queue.push(JSON.stringify(words([["Hi", 0], ["there.", 0]], { speech_final: true })));
+  m.start(null);
+  expect(started.at(-1)).toEqual([null, false]);
+  queue.push(JSON.stringify(words([["Hi", "A"], ["there.", "A"]])));
   await tick(400);
   expect(m.turns()[0].speaker).toBe("v0");
   expect(asked.length).toBe(1);
@@ -387,9 +396,9 @@ test("sin contexto no se calienta; «—» deja la intervención sin sugerencia 
   const m = new MeetingController(() => "claude-sonnet-5-5");
   m.setMe("Darwin,   llevo el backend");
   expect(storage.get("meeting.me")).toBe("Darwin, llevo el backend");
-  m.start(null, "es");
+  m.start(null);
   reply = "—";
-  queue.push(results("Ana, ¿viste el partido?", { speech_final: true }));
+  queue.push(results("Ana, ¿viste el partido?"));
   await tick(400);
   expect(warmups).toBe(0);
   expect(asked[0].system).toContain("Darwin, llevo el backend");

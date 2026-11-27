@@ -1,5 +1,5 @@
-// Modo reunión, la parte de JS: recoge lo que Deepgram transcribe (`Meeting`
-// en Rust captura el audio y habla con Deepgram), lo convierte en
+// Modo reunión, la parte de JS: recoge lo que AssemblyAI transcribe (`Meeting`
+// en Rust captura el audio y habla con AssemblyAI), lo convierte en
 // intervenciones y pide a Claude qué decir. Como en el Maka de Electron:
 // parciales al momento, una sola respuesta en curso (las intervenciones que
 // llegan mientras tanto se juntan) y hasta 20 intervenciones en memoria. En
@@ -12,8 +12,6 @@ import { ClaudeSession } from "./claude";
 
 export type { Source };
 
-export type Language = "es" | "en" | "multi";
-
 /** Un .md adjunto como contexto de la reunión. */
 export type Doc = { name: string; text: string };
 
@@ -21,7 +19,7 @@ export type Turn = {
   id: number;
   /** Lo que se dijo (o la pregunta escrita, con una captura). */
   text: string;
-  /** Qué voz lo dijo: `ME` (el usuario, por su micrófono) o `v0`, `v1`… (Deepgram); sin ella, una captura. */
+  /** Qué voz lo dijo: `ME` (el usuario, por su micrófono) o `v0`, `v1`… (AssemblyAI); sin ella, una captura. */
   speaker?: string;
   /** Las capturas enviadas con esta intervención, para mostrarlas («2 capturas · 1920×1080»). */
   shot?: string;
@@ -58,89 +56,84 @@ const FIRST_ANSWER_TIMEOUT_MS = 180_000;
 /** La clave de la voz del usuario (su micrófono, canal 0). */
 export const ME = "me";
 
-/** Una intervención cerrada: de qué voz (`ME` o `v0`, `v1`… según Deepgram) y qué dijo. */
+/** Una intervención cerrada: de qué voz (`ME` o `v0`, `v1`… según AssemblyAI) y qué dijo. */
 export type Utterance = { speaker: string; text: string };
 
-type DeepgramWord = { word?: string; punctuated_word?: string; speaker?: number };
+type AssemblyWord = { text?: string; speaker?: string };
+type AssemblyTurn = {
+  type?: string;
+  turn_order?: number;
+  end_of_turn?: boolean;
+  transcript?: string;
+  speaker_label?: string;
+  words?: AssemblyWord[];
+};
 
-/** Acumula segmentos confirmados de Deepgram, por canal; `speech_final` o
- * `UtteranceEnd` cierran lo pendiente de ese canal, partido por voz
- * (`diarize`: cada palabra trae su número de voz). Con micrófono, el canal 0
- * es el usuario y el 1 los demás (`multichannel`). */
+/** `A` → `v0`, `B` → `v1`…; `UNKNOWN`, `PENDING` o nada → `null`. */
+const voiceOf = (label: string | undefined) => (label && /^[A-Z]$/.test(label) ? `v${label.charCodeAt(0) - 65}` : null);
+
+/** Convierte los `Turn` de AssemblyAI (como los entrega `Meeting.poll`:
+ * `{ who: "me" | "others", msg }`) en intervenciones. Un turno sin cerrar es
+ * el parcial que se ve al momento; al cerrarse (`end_of_turn`) sale, partido
+ * por voz: cada palabra trae la suya (`speaker`), así que quien interrumpe a
+ * mitad de un turno sale aparte. Lo de la conexión del micrófono es «Tú». */
 export class Transcript {
-  private pending = new Map<number, Utterance[]>();
-  private interim = new Map<number, string>();
+  private interim = new Map<string, string>();
   private seen = new Set<string>();
+  /** La última voz de los demás: la de una palabra sin voz todavía (`PENDING`). */
+  private lastVoice: string | null = null;
   preview = "";
-
-  constructor(private microphone = false) {}
-
-  private voice(channel: number, speaker: number | undefined) {
-    return this.microphone && channel === 0 ? ME : `v${speaker ?? 0}`;
-  }
 
   accept(raw: unknown): Utterance[] {
     if (!raw || typeof raw !== "object") return [];
-    const msg = raw as {
-      type?: string;
-      start?: number;
-      duration?: number;
-      is_final?: boolean;
-      speech_final?: boolean;
-      channel_index?: number[];
-      channel?: number[] | { alternatives?: { transcript?: string; words?: DeepgramWord[] }[] };
-    };
-    if (msg.type === "UtteranceEnd") {
-      // Con varios canales trae el suyo (`channel: [índice, total]`).
-      const channel = Array.isArray(msg.channel) ? msg.channel[0] : undefined;
-      const closed = channel === undefined ? [...this.pending.keys()].flatMap((c) => this.flush(c)) : this.flush(channel);
+    const { who, msg } = raw as { who?: string; msg?: AssemblyTurn };
+    if (!msg || msg.type !== "Turn") return [];
+    const source = who === "me" ? "me" : "others";
+    const text = msg.transcript?.trim() ?? "";
+    if (!msg.end_of_turn) {
+      this.interim.set(source, text);
       this.updatePreview();
-      return closed;
+      return [];
     }
-    if (msg.type !== "Results" || Array.isArray(msg.channel)) return [];
-    const channel = msg.channel_index?.[0] ?? 0;
-    const alternative = msg.channel?.alternatives?.[0];
-    const text = alternative?.transcript?.trim() ?? "";
-    if (msg.is_final && text) {
-      const key = `${channel}:${msg.start}:${msg.duration}:${text}`;
-      if (!this.seen.has(key)) {
-        this.seen.add(key);
-        if (this.seen.size > 512) this.seen.delete(this.seen.values().next().value!);
-        const words = alternative?.words ?? [];
-        const parts = this.pending.get(channel) ?? [];
-        if (words.length === 0) parts.push({ speaker: this.voice(channel, undefined), text });
-        for (const w of words) {
-          const word = (w.punctuated_word ?? w.word ?? "").trim();
-          if (word) parts.push({ speaker: this.voice(channel, w.speaker), text: word });
-        }
-        this.pending.set(channel, parts);
+    this.interim.delete(source);
+    this.updatePreview();
+    const key = `${source}:${msg.turn_order}`;
+    if (!text || this.seen.has(key)) return [];
+    this.seen.add(key);
+    if (this.seen.size > 512) this.seen.delete(this.seen.values().next().value!);
+    if (source === "me") return [{ speaker: ME, text }];
+
+    const turnVoice = voiceOf(msg.speaker_label);
+    const closed: Utterance[] = [];
+    let previous: string | null = null;
+    for (const w of msg.words ?? []) {
+      const word = w.text?.trim();
+      if (!word) continue;
+      const voice: string = voiceOf(w.speaker) ?? previous ?? turnVoice ?? this.lastVoice ?? "v0";
+      previous = voice;
+      const last = closed[closed.length - 1];
+      if (last && last.speaker === voice) last.text += ` ${word}`;
+      else closed.push({ speaker: voice, text: word });
+    }
+    // Una palabra suelta a media frase entre dos tramos de la misma voz es
+    // casi siempre un titubeo de la etiqueta (pasa al empezar, mientras
+    // aprende las voces): se queda con sus vecinos. Si cierra frase
+    // («Mañana.», «¿Sí?») es alguien que contesta y sale aparte.
+    for (let i = closed.length - 2; i >= 1; i--) {
+      const [before, island, after] = [closed[i - 1], closed[i], closed[i + 1]];
+      if (before.speaker === after.speaker && !island.text.includes(" ") && !/[.?!…]$/.test(island.text)) {
+        before.text += ` ${island.text} ${after.text}`;
+        closed.splice(i, 2);
       }
     }
-    this.interim.set(channel, msg.is_final ? "" : text);
-    const closed = msg.speech_final ? this.flush(channel) : [];
-    this.updatePreview();
-    return closed;
-  }
-
-  /** Lo pendiente del canal, en una intervención por cada tramo seguido de la misma voz. */
-  private flush(channel: number): Utterance[] {
-    const parts = this.pending.get(channel) ?? [];
-    this.pending.delete(channel);
-    this.interim.delete(channel);
-    const closed: Utterance[] = [];
-    for (const part of parts) {
-      const last = closed[closed.length - 1];
-      if (last && last.speaker === part.speaker) last.text += ` ${part.text}`;
-      else closed.push({ ...part });
-    }
+    // Una sola voz: el texto del turno tal cual (formateado entero).
+    if (closed.length <= 1) closed.splice(0, closed.length, { speaker: closed[0]?.speaker ?? turnVoice ?? this.lastVoice ?? "v0", text });
+    this.lastVoice = closed[closed.length - 1].speaker;
     return closed;
   }
 
   private updatePreview() {
-    const texts: string[] = [];
-    for (const [channel, parts] of this.pending) texts.push(...parts.map((p) => p.text), this.interim.get(channel) ?? "");
-    for (const [channel, text] of this.interim) if (!this.pending.has(channel)) texts.push(text);
-    this.preview = texts.filter(Boolean).join(" ");
+    this.preview = [this.interim.get("others"), this.interim.get("me")].filter(Boolean).join(" · ");
   }
 }
 
@@ -174,7 +167,6 @@ export class MeetingController {
   readonly names = signal<Record<string, string>>({});
 
   private transcript = new Transcript();
-  private listeningWithMic = false;
   /** Renombres que Claude aún no sabe: van delante de la próxima petición. */
   private renames: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -320,15 +312,14 @@ ${doc.text.trim()}
 
   /** Empieza a escuchar `source` (o todo el equipo con `null`). Lanza si
    * falta la clave o la app ya no está abierta. */
-  start(source: Source | null, language: Language) {
+  start(source: Source | null) {
     this.stop();
     const microphone = this.microphone();
-    Meeting.start(source?.pid ?? null, language, microphone);
+    Meeting.start(source?.pid ?? null, microphone);
     this.source.set(
       `${source ? `${source.name} · ${source.pid}` : "Todo el audio del equipo"}${microphone ? " + tu micrófono" : ""}`,
     );
-    this.transcript = new Transcript(microphone);
-    this.listeningWithMic = microphone;
+    this.transcript = new Transcript();
     this.names.set({});
     this.renames = [];
     this.turns.set([]);
@@ -380,7 +371,7 @@ ${doc.text.trim()}
 
   private poll() {
     const p = Meeting.poll();
-    if (p.reconnected) this.transcript = new Transcript(this.listeningWithMic);
+    if (p.reconnected) this.transcript = new Transcript();
     for (const raw of p.messages) {
       let message: unknown;
       try {

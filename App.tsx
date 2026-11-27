@@ -7,7 +7,7 @@
 // bandeja y tiene un "modo fantasma" en el que los clics lo atraviesan.
 import { platform } from "process";
 import { cleanup, effect, mount, Scroll, signal, Text, View } from "nsh";
-import { Button, Input, TextView } from "nsh/base";
+import { Button, Input, Scrollbar, TextView } from "nsh/base";
 import { currentWindow, displays, GlobalShortcut, Tray, Window, type WindowRef } from "nsh/desktop";
 import { Screen, type Shot } from "maka-tutor-nsh/native";
 import { ClaudeSession } from "./claude";
@@ -31,8 +31,6 @@ type Message = {
   shot?: string;
 };
 
-// Material de cristal: Liquid Glass en macOS/iOS 26; en Windows, el desenfoque de respaldo.
-const glass = { glassEffect: "regular", backdropFilter: "blur(24px) saturate(180%)" } as const;
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -309,8 +307,6 @@ function App() {
     if (!busy()) restartKeepingContext();
   };
 
-  const toggleSettings = () => page.set(page() === "settings" ? "chat" : "settings");
-  const toggleMeeting = () => page.set(page() === "meeting" ? "chat" : "meeting");
 
   /** Guarda la conversación abierta (la crea la primera vez). */
   const persist = () => {
@@ -347,6 +343,11 @@ function App() {
     query.set("");
     page.set("history");
     refreshHistory();
+  };
+
+  const openPage = (next: "chat" | "history" | "settings" | "meeting") => {
+    if (next === "history" && page() !== "history") return toggleHistory();
+    page.set(next);
   };
 
   const openConversation = (conversation: History.Conversation) => {
@@ -420,8 +421,6 @@ function App() {
   });
   cleanup(() => Tray.set(null));
 
-  // Botón "píldora" de cristal: hairline, relleno translúcido y respuesta al pulsar.
-  const pill = "flex-row items-center gap-1.5 rounded-full border border-black/5 bg-white/50 px-3 py-1.5 transition-transform duration-150 active:scale-95 dark:border-white/10 dark:bg-white/10";
 
   return (
     // Siempre oscuro (nsh.json "appearance": "dark"), como el Maka de Electron:
@@ -434,39 +433,50 @@ function App() {
       }}
     >
       {/* Cabecera: arrastra la ventana. */}
-      <View desktop={{ windowDrag: true }} class="flex-row items-center gap-3 px-4 pt-3.5 pb-2.5">
-        <View class="size-8 items-center justify-center rounded-[10px] bg-[#007AFF] dark:bg-[#0A84FF]" style={{ boxShadow: "0 2px 8px rgb(0 122 255 / 0.35)" }}>
-          <Text class="text-sm font-bold text-white">M</Text>
+      <View desktop={{ windowDrag: true }} class="flex-row items-center gap-2.5 px-4 pt-3.5 pb-2">
+        <View class="size-7 items-center justify-center rounded-[9px] bg-[#0A84FF]" style={{ boxShadow: "0 2px 8px rgb(10 132 255 / 0.35)" }}>
+          <Text class="text-[13px] font-bold text-white">M</Text>
         </View>
-        <View class="flex-1">
-          <Text class="text-[15px] font-semibold tracking-tight text-black/90 dark:text-white/95">Maka Tutor</Text>
-          <Text class="text-[11px] text-black/45 dark:text-white/45">
-            {`${meeting.active ? "● Reunión · " : ""}${Settings.modelLabel(model())}${gatewayHint() ? " · gateway" : keyHint() ? " · API key" : ""} · ${protectedWindows() > 0 ? "invisible en capturas" : "visible en capturas"}${ghost() ? " · fantasma" : ""}`}
+        <View class="flex-1 gap-0.5">
+          <Text class="line-clamp-1 text-[15px] font-semibold tracking-tight text-white/95">Maka Tutor</Text>
+          <Text class="line-clamp-1 text-[11px] text-white/45">
+            {`${Settings.modelLabel(model())}${gatewayHint() ? " · gateway" : keyHint() ? " · API key" : ""}${protectedWindows() > 0 ? " · oculto en capturas" : " · visible en capturas"}${ghost() ? " · fantasma" : ""}`}
           </Text>
         </View>
-        <Button onPress={toggleHistory} class={pill}>
-          <Text class="text-xs font-medium text-black/75 dark:text-white/80">{page() === "history" ? "Chat" : "Historial"}</Text>
-        </Button>
-        <Button onPress={newChat} class={pill}>
-          <Text class="text-xs font-medium text-black/75 dark:text-white/80">Nueva</Text>
-        </Button>
+        {page() === "chat" && messages().length > 0 ? (
+          <Button onPress={newChat} class="rounded-lg bg-white/10 px-2.5 py-1 transition-transform duration-150 active:scale-95">
+            <Text class="text-[12px] font-medium text-white/85">＋ Nueva</Text>
+          </Button>
+        ) : null}
         <Button
-          onPress={toggleMeeting}
-          class={`size-7 items-center justify-center rounded-full transition-transform duration-150 active:scale-90 ${page() === "meeting" ? "bg-[#007AFF] dark:bg-[#0A84FF]" : meeting.active ? "bg-[#FF3B30]/15" : "bg-black/5 dark:bg-white/10"}`}
+          onPress={() => win.hide()}
+          accessibilityLabel="Ocultar (Ctrl+Shift+Espacio la vuelve a abrir)"
+          tooltip="Ocultar · Ctrl+Shift+Espacio la abre"
+          class="size-7 items-center justify-center rounded-full bg-white/10 transition-transform duration-150 active:scale-90"
         >
-          <Text class={`text-[12px] ${page() === "meeting" ? "text-white" : meeting.active ? "text-[#FF3B30]" : "text-black/55 dark:text-white/60"}`}>🎙</Text>
-        </Button>
-        <Button
-          onPress={toggleSettings}
-          class={`size-7 items-center justify-center rounded-full transition-transform duration-150 active:scale-90 ${page() === "settings" ? "bg-[#007AFF] dark:bg-[#0A84FF]" : "bg-black/5 dark:bg-white/10"}`}
-        >
-          <Text class={`text-[13px] ${page() === "settings" ? "text-white" : "text-black/55 dark:text-white/60"}`}>⚙</Text>
-        </Button>
-        <Button onPress={() => win.hide()} class="size-7 items-center justify-center rounded-full bg-black/5 transition-transform duration-150 active:scale-90 dark:bg-white/10">
-          <Text class="text-xs text-black/55 dark:text-white/60">✕</Text>
+          <Text class="text-xs text-white/60">✕</Text>
         </Button>
       </View>
-      <View class="mx-4 h-px bg-black/5 dark:bg-white/10" />
+
+      {/* Pestañas: dónde estás siempre a la vista. */}
+      <View class="mx-4 mb-1 flex-row rounded-xl bg-black/30 p-1">
+        {(
+          [
+            ["chat", "Chat"],
+            ["meeting", "Reunión"],
+            ["history", "Historial"],
+            ["settings", "Ajustes"],
+          ] as const
+        ).map(([id, text]) => (
+          <Button
+            onPress={() => openPage(id)}
+            class={`flex-1 flex-row items-center justify-center gap-1 rounded-lg py-1.5 ${page() === id ? "bg-white/15" : "active:bg-white/[0.06]"}`}
+          >
+            {id === "meeting" && meeting.active ? <View class="size-1.5 rounded-full bg-[#FF453A]" /> : null}
+            <Text class={`text-[13px] ${page() === id ? "font-semibold text-white" : "font-medium text-white/55"}`}>{text}</Text>
+          </Button>
+        ))}
+      </View>
 
       <UpdateBanner />
       {page() === "meeting" ? (
@@ -475,13 +485,10 @@ function App() {
         <SettingsPage model={model()} busy={busy()} onModel={changeModel} keyHint={keyHint()} onKeyChange={changeKey} gatewayHint={gatewayHint()} onGatewayChange={changeGateway} />
       ) : page() === "history" ? (
         <View class="flex-1 gap-3 px-4 pt-3">
-          <View
-            class="flex-row items-center gap-2 rounded-full border border-white/60 bg-white/65 px-3.5 py-1.5 dark:border-white/10 dark:bg-white/10"
-            style={glass}
-          >
-            <Text class="text-[13px] text-black/40 dark:text-white/40">⌕</Text>
+          <View class="flex-row items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2">
+            <Text class="text-[14px] text-white/45">⌕</Text>
             <Input
-              class="flex-1 bg-transparent text-[14px] text-black/90 dark:text-white/95"
+              class="flex-1 bg-transparent text-[14px] text-white placeholder:text-white/40"
               value={query()}
               onChange={({ value }) => query.set(value)}
               placeholder="Buscar en el historial…"
@@ -491,32 +498,31 @@ function App() {
           <Scroll class="flex-1">
             <View class="gap-1.5 pb-4">
               {history().filter((c) => History.matches(c, query())).length === 0 ? (
-                <Text class="pt-10 text-center text-[13px] text-black/45 dark:text-white/45">
+                <Text class="mt-10 text-center text-[13px] text-black/45 dark:text-white/45">
                   {query().trim() ? "Nada coincide con la búsqueda." : "Aún no hay conversaciones guardadas."}
                 </Text>
               ) : null}
               <Each of={history().filter((c) => History.matches(c, query()))}>
                 {(conversation) => (
-                  <View
-                    class="flex-row items-center gap-2 rounded-2xl border border-white/50 bg-white/50 py-1.5 pr-1.5 pl-3.5 dark:border-white/10 dark:bg-white/[0.06]"
-                    style={glass}
-                  >
+                  <View class="flex-row items-center gap-2 rounded-2xl border border-white/[0.08] bg-white/[0.06] py-1.5 pr-1.5 pl-3.5">
                     <Button
                       onPress={() => openConversation(conversation())}
                       class="flex-1 gap-0.5 py-1 transition-transform duration-150 active:scale-[0.98]"
                     >
-                      <Text class="line-clamp-1 text-[14px] font-medium text-black/85 dark:text-white/90">
+                      <Text class="line-clamp-1 text-[14px] font-medium text-white/90">
                         {conversation().title}
                       </Text>
-                      <Text class="text-[11px] text-black/45 dark:text-white/45">
+                      <Text class="text-[12px] text-white/45">
                         {`${History.when(conversation().updatedAt)} · ${Math.ceil(conversation().messages.length / 2)} pregunta(s)`}
                       </Text>
                     </Button>
                     <Button
                       onPress={() => deleteConversation(conversation().id)}
-                      class="size-7 items-center justify-center rounded-full transition-transform duration-150 active:scale-90 active:bg-black/5 dark:active:bg-white/10"
+                      accessibilityLabel="Borrar la conversación"
+                      tooltip="Borrar"
+                      class="size-8 items-center justify-center rounded-full transition-transform duration-150 active:scale-90 active:bg-white/10"
                     >
-                      <Text class="text-xs text-black/40 dark:text-white/40">✕</Text>
+                      <Text class="text-xs text-white/45">✕</Text>
                     </Button>
                   </View>
                 )}
@@ -529,17 +535,17 @@ function App() {
         <View class="gap-2.5 px-4 py-4">
           {messages().length === 0 ? (
             <View class="items-center gap-3 px-6 pt-16">
-              <View class="size-14 items-center justify-center rounded-2xl border border-white/50 bg-white/40 dark:border-white/10 dark:bg-white/10" style={glass}>
-                <Text class="text-2xl">🎓</Text>
+              <View class="size-14 items-center justify-center rounded-2xl bg-[#30D158]/15">
+                <Text class="text-[26px] font-bold text-[#30D158]">✦</Text>
               </View>
-              <Text class="text-[17px] font-semibold tracking-tight text-black/85 dark:text-white/90">Pregunta sobre tu pantalla</Text>
-              <Text class="text-center text-[13px] leading-5 text-black/50 dark:text-white/50">
+              <Text class="text-[17px] font-semibold tracking-tight text-white/90">Pregunta sobre tu pantalla</Text>
+              <Text class="text-center text-[13px] leading-5 text-white/50">
                 Captura lo que tienes delante y Claude te lo explica paso a paso.
               </Text>
               <View class="flex-row gap-1.5 pt-1">
                 {["Ctrl", "Shift", "Espacio"].map((key) => (
-                  <View class="rounded-md border border-black/10 bg-white/60 px-2 py-0.5 dark:border-white/15 dark:bg-white/10">
-                    <Text class="text-[11px] font-medium text-black/60 dark:text-white/70">{key}</Text>
+                  <View class="rounded-md border border-white/15 bg-white/10 px-2 py-0.5">
+                    <Text class="text-[11px] font-medium text-white/70">{key}</Text>
                   </View>
                 ))}
               </View>
@@ -550,7 +556,7 @@ function App() {
               message().role === "user" ? (
                 // Tú: a la derecha, burbuja azul.
                 <View class="max-w-[82%] gap-1 self-end">
-                  <Text class="self-end px-1 text-[11px] font-medium text-white/40">Tú</Text>
+                  <Text class="self-end mx-1 text-[11px] font-medium text-white/40">Tú</Text>
                   <View class="gap-0.5 rounded-[18px] bg-[#0A84FF] px-3.5 py-2">
                     {message().shot ? (
                       <Text class="text-[11px] font-medium text-white/75">{`📷 ${message().shot}`}</Text>
@@ -565,7 +571,7 @@ function App() {
                     <Text class="text-[13px] font-bold text-[#30D158]">✦</Text>
                   </View>
                   <View class="flex-1 gap-1">
-                    <Text class="px-1 text-[12px] font-semibold text-[#30D158]">
+                    <Text class="mx-1 text-[12px] font-semibold text-[#30D158]">
                       {message().text() ? "Maka" : "Maka está pensando…"}
                     </Text>
                     {message().text() ? (
@@ -587,21 +593,20 @@ function App() {
       <View class="gap-2 px-3 pb-3">
         <Shots shots={shots()} onRemove={removeShot} onClear={() => shots.set([])} />
         {status() ? (
-          <Text class="px-1 text-[11px] text-black/40 dark:text-white/40">{status()}</Text>
+          <Text class="mx-1 text-[12px] text-white/50">{status()}</Text>
         ) : null}
-        <View
-          class="flex-row items-center gap-2 rounded-full border border-white/60 bg-white/65 py-1.5 pr-1.5 pl-1.5 dark:border-white/10 dark:bg-white/10"
-          style={{ ...glass, boxShadow: "0 4px 16px rgb(0 0 0 / 0.08)" }}
-        >
+        <View class="flex-row items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.07] p-1.5">
           <Button
             onPress={() => void captureAndAsk()}
             disabled={shots().length >= MAX_SHOTS}
-            class="size-8 items-center justify-center rounded-full bg-black/5 transition-transform duration-150 active:scale-90 disabled:opacity-30 dark:bg-white/10"
+            accessibilityLabel="Capturar la pantalla"
+            tooltip="Capturar · Ctrl+Shift+Espacio"
+            class="size-8 items-center justify-center rounded-xl bg-white/10 transition-transform duration-150 active:scale-90 disabled:opacity-30"
           >
             <Text class="text-sm">{shots().length ? "＋" : "📷"}</Text>
           </Button>
           <Input
-            class="flex-1 bg-transparent text-[14px] text-black/90 dark:text-white/95"
+            class="flex-1 bg-transparent text-[14px] text-white placeholder:text-white/40"
             value={draft()}
             onChange={({ value }) => draft.set(value)}
             onSubmit={send}
@@ -617,7 +622,8 @@ function App() {
           <Button
             onPress={send}
             disabled={busy() || !draft().trim()}
-            class="size-8 items-center justify-center rounded-full bg-[#007AFF] transition-transform duration-150 active:scale-90 disabled:opacity-30 dark:bg-[#0A84FF]"
+            accessibilityLabel="Enviar"
+            class="size-8 items-center justify-center rounded-xl bg-[#0A84FF] transition-transform duration-150 active:scale-90 disabled:opacity-30"
           >
             <Text class="text-[15px] font-bold text-white">{busy() ? "…" : "↑"}</Text>
           </Button>
@@ -627,5 +633,16 @@ function App() {
     </View>
   );
 }
+
+// Barra de scroll siempre visible y arrastrable (por defecto solo aparece
+// mientras se desplaza): sin ratón, con un touchpad, hace falta verla.
+Scrollbar.setTheme({
+  mode: "always",
+  minThumbLength: 40,
+  vertical: {
+    class: "group absolute inset-y-1 right-0 w-3.5 px-[3px]",
+    thumbClass: "w-full rounded-full bg-white/25 group-hover:bg-white/45",
+  },
+});
 
 mount(App);

@@ -55,7 +55,7 @@ pub fn start(target: Target, stop: Arc<AtomicBool>, out: Sender<Result<Vec<u8>, 
 
 /// Como `start`, pero además con el micrófono: el PCM sigue siendo s16 a 48 kHz
 /// con dos canales, ahora el 0 el micrófono (la voz del usuario) y el 1 lo que
-/// suena (los demás), cada uno en mono. Así Deepgram (`multichannel`) separa
+/// suena (los demás), cada uno en mono. Así `meeting` manda cada canal a su conexión y separa
 /// sin error lo que dice el usuario. Falla si el micrófono no se puede abrir.
 pub fn start_with_microphone(
     target: Target,

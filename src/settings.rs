@@ -7,8 +7,8 @@
 //! - `Gateway`: una URL y un token de un proxy compatible con la API de
 //!   Anthropic (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`, como en la
 //!   terminal). Tiene prioridad sobre la API key; el token tampoco vuelve a JS.
-//! - `DeepgramKey`: la clave de Deepgram para el modo reunión, también en el
-//!   almacén de claves; solo la lee el hilo de la escucha.
+//! - `TranscriptionKey`: la clave de AssemblyAI para el modo reunión, también
+//!   en el almacén de claves; solo la lee el hilo de la escucha.
 //! - `Startup`: arrancar con la sesión.
 
 use nsh_core::prelude::*;
@@ -87,35 +87,35 @@ impl Gateway {
     }
 }
 
-/// La clave de Deepgram (transcripción del modo reunión).
+/// La clave de AssemblyAI (transcripción del modo reunión).
 #[module]
-pub struct DeepgramKey;
+pub struct TranscriptionKey;
 
 #[module]
-impl DeepgramKey {
+impl TranscriptionKey {
     /// La guarda; lanza si el formato no es válido o el sistema no la guarda.
     pub fn save(value: String) -> Result<(), String> {
         let value = value.trim().to_owned();
         if value.len() < 20 || value.len() > 256 || !value.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err("no parece una clave de Deepgram (letras y números, sin espacios)".into());
+            return Err("No parece una clave de AssemblyAI (letras y números, sin espacios).".into());
         }
-        imp::write(imp::DEEPGRAM, &value)
+        imp::write(imp::TRANSCRIPTION, &value)
     }
 
     /// La borra.
     pub fn clear() -> Result<(), String> {
-        imp::delete(imp::DEEPGRAM)
+        imp::delete(imp::TRANSCRIPTION)
     }
 
     /// La guardada, enmascarada (`…a1b2`), o `None`.
     pub fn hint() -> Option<String> {
-        imp::read(imp::DEEPGRAM).map(|value| format!("…{}", tail(&value)))
+        imp::read(imp::TRANSCRIPTION).map(|value| format!("…{}", tail(&value)))
     }
 }
 
-/// La clave de Deepgram guardada, para el hilo de la escucha.
-pub(crate) fn deepgram_key() -> Option<String> {
-    imp::read(imp::DEEPGRAM)
+/// La clave de AssemblyAI guardada, para el hilo de la escucha.
+pub(crate) fn transcription_key() -> Option<String> {
+    imp::read(imp::TRANSCRIPTION)
 }
 
 /// Arrancar con la sesión.
@@ -211,7 +211,7 @@ mod imp {
     use windows::core::{HSTRING, PWSTR};
 
     pub(super) const TARGET: &str = "maka-tutor-nsh:anthropic-api-key";
-    pub(super) const DEEPGRAM: &str = "maka-tutor-nsh:deepgram-key";
+    pub(super) const TRANSCRIPTION: &str = "maka-tutor-nsh:assemblyai-key";
     pub(super) const GATEWAY: &str = "maka-tutor-nsh:gateway";
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const RUN_VALUE: &str = "Maka Tutor NSH";
@@ -326,7 +326,7 @@ mod imp {
     use std::process::{Command, Stdio};
 
     pub(super) const TARGET: &str = "anthropic-api-key";
-    pub(super) const DEEPGRAM: &str = "deepgram-key";
+    pub(super) const TRANSCRIPTION: &str = "assemblyai-key";
     pub(super) const GATEWAY: &str = "gateway";
     const SERVICE: &str = "maka-tutor-nsh";
     const APP_ID: &str = "com.eijunnn.makatutornsh";
@@ -446,7 +446,7 @@ mod imp {
 #[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     pub(super) const TARGET: &str = "";
-    pub(super) const DEEPGRAM: &str = "";
+    pub(super) const TRANSCRIPTION: &str = "";
     pub(super) const GATEWAY: &str = "";
     pub(super) fn write(_target: &str, _value: &str) -> Result<(), String> {
         Err("guardar la API key solo está implementado en Windows".into())
